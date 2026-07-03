@@ -1,9 +1,9 @@
-"""DETERMINISTIC Risk Governor v4 (Binance). AI mengusulkan; kode ini memutuskan.
+"""DETERMINISTIC Risk Governor v4.1 (Binance). AI mengusulkan; kode ini memutuskan.
 
 Gerbang (SEMUA harus lolos):
   1. Sinyal actionable (long/short)
-  2. Regime alignment: trending_up->long saja, trending_down->short saja,
-     ranging/chop/unknown -> NO-TRADE
+  2. Regime alignment: trending_up->long, trending_down->short,
+     ranging->long/short (mean reversion diizinkan), chop->NO-TRADE
   3. Confidence >= MIN_CONFIDENCE (65)
   4. Geometry valid + R:R >= MIN_RR (2.0)
   5. Stop >= MIN_STOP_PCT (0.35%) -- stop mikro di dalam noise = realized risk >> rencana
@@ -51,9 +51,11 @@ def evaluate(pte, mse, snapshot):
         elif regime == "trending_down" and signal != "short":
             approved = False
             reasons.append("Sinyal LONG berlawanan regime trending_down -> DITOLAK")
-        elif regime not in ("trending_up", "trending_down"):
+        elif regime == "chop":
             approved = False
-            reasons.append(f"Regime {regime} -> NO-TRADE (kebijakan trend-only)")
+            reasons.append("Regime chop -> NO-TRADE (market tidak terbaca)")
+        elif regime == "ranging":
+            reasons.append(f"Regime ranging -> mean reversion DIIZINKAN ({signal})")
 
     conf = _num(pte.get("confidence_pct"))
     if signal in ("long", "short"):
