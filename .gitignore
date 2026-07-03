@@ -1,0 +1,14 @@
+# ===== RAHASIA & RUNTIME — JANGAN PERNAH MASUK REPO =====
+.env
+bot_state.json
+*.log
+
+# ===== Python =====
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ===== OS / editor =====
+.DS_Store
+Thumbs.db
