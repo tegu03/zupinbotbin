@@ -4,11 +4,13 @@ import os, sys, asyncio, json, time
 os.environ.update({
     "MIN_CONFIDENCE": "65", "MIN_RR": "2.0", "MIN_STOP_PCT": "0.0035",
     "DAILY_LOSS_LIMIT_PCT": "0.03", "DAILY_PROFIT_TARGET_PCT": "0.10",
-    "RESUME_HOUR": "0", "STATE_FILE": "/tmp/zb_test_state.json", "DRY_RUN": "true",
+    "RESUME_HOUR": "0", "STATE_FILE": os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), "zb_test_state.json"),
+    "DRY_RUN": "true",
     "WATCH_POLL_SEC": "0.05", "LOOP_MINUTES": "1", "BINANCE_MIN_NOTIONAL": "100",
     "INITIAL_CAPITAL": "5000",
 })
 
+from config import CONFIG
 from risk import evaluate
 import exchange as ex
 
@@ -36,7 +38,8 @@ d = evaluate(*mk("short", 80, "trending_down", 60000, 60600, 58600)); check("con
 # Regime alignment
 d = evaluate(*mk("short", 80, "trending_up", 60000, 60600, 58600)); check("up + SHORT -> DITOLAK", not d["approved"])
 d = evaluate(*mk("long", 80, "trending_down"));                     check("down + LONG -> DITOLAK", not d["approved"])
-d = evaluate(*mk("long", 80, "ranging"));                           check("ranging -> DITOLAK", not d["approved"])
+d = evaluate(*mk("long", 80, "ranging"));                           check("ranging + LONG -> DIIZINKAN (mean reversion)", d["approved"])
+d = evaluate(*mk("short", 80, "ranging", 60000, 60600, 58600));     check("ranging + SHORT -> DIIZINKAN (mean reversion)", d["approved"])
 d = evaluate(*mk("short", 80, "chop", 60000, 60600, 58600));        check("chop -> DITOLAK", not d["approved"])
 
 # R:R & stop mikro
@@ -55,10 +58,11 @@ d = evaluate(*mk("long", 80, "trending_up", dp=-2.0)); check("daily -2.0% -> bol
 d = evaluate(*mk("no_trade", 0, "chop", None, None, None, dp=10.5)); check("daily +10.5% -> profit_lock", d["profit_lock"])
 
 # Latch state harian (UTC)
-with open("/tmp/zb_test_state.json", "w") as f:
+_sf = CONFIG.state_file
+with open(_sf, "w") as f:
     json.dump({"date": ex._today(), "baseline_equity": 5000.0}, f)
 ex.latch_kill(-3.5); check("latch_kill -> kill_latched", ex.kill_latched())
-with open("/tmp/zb_test_state.json", "w") as f:
+with open(_sf, "w") as f:
     json.dump({"date": "2000-01-01", "baseline_equity": 5000.0, "killed_on": "2000-01-01"}, f)
 ex._daily_baseline(4900.0); check("hari baru -> latch lepas + baseline reset", not ex.kill_latched())
 ex.latch_profit(10.2); check("latch_profit -> profit_latched", ex.profit_latched())
