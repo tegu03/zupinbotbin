@@ -1,17 +1,20 @@
-"""Market-data v4: SATU venue untuk analisis & eksekusi = Binance.
-Data SELALU dari mainnet publik (fapi.binance.com, tanpa API key) — sehingga
-funding/OI/long-short adalah crowd RIIL sekalipun eksekusi di testnet/demo.
+"""Market-data v4.1: Binance mainnet + orderbook + technical indicators.
+Perubahan dari v4:
+  - TAMBAH: orderbook depth (top 20 bid/ask) → layer orderbook AI sekarang punya data
+  - TAMBAH: RSI-14 → momentum oscillator
+  - TAMBAH: EMA-12 / EMA-26 → trend strength (MACD-like)
+  - TAMBAH: Bollinger Bands (20, 2σ) → volatility + mean reversion
+  - TAMBAH: support/resistance levels dari recent swing highs/lows
+  - TAMBAH: ATR-14 → volatility measure untuk stop distance reference
 
-Endpoint (dokumentasi resmi Binance USDT-M Futures):
-  - /fapi/v1/klines                          OHLCV
-  - /fapi/v1/premiumIndex                    mark price + lastFundingRate (riil!)
-  - /futures/data/openInterestHist           OI historis
-  - /futures/data/globalLongShortAccountRatio  rasio akun long/short
-  - /futures/data/takerlongshortRatio        taker buy/sell volume ratio
-  - alternative.me                           Fear & Greed
-
-Prinsip fail-safe: satu sumber gagal -> None + tercatat di snapshot["data_gaps"];
-LLM diminta menurunkan confidence, bukan mengarang angka.
+Endpoint Binance (semua publik mainnet, tanpa API key):
+  - /fapi/v1/klines       OHLCV
+  - /fapi/v1/premiumIndex  mark price + lastFundingRate
+  - /fapi/v1/depth         orderbook depth
+  - /futures/data/openInterestHist
+  - /futures/data/globalLongShortAccountRatio
+  - /futures/data/takerlongshortRatio
+  - alternative.me         Fear & Greed
 """
 import time
 import datetime
@@ -35,6 +38,74 @@ def _num(x):
 
 def _sma(a, n):
     return sum(a[-n:]) / n if len(a) >= n else None
+
+
+def _ema(data, period):
+    """Exponential Moving Average."""
+    if len(data) < period:
+        return None
+    k = 2 / (period + 1)
+    ema = sum(data[:period]) / period
+    for price in data[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
+def _rsi(closes, period=14):
+    """Relative Strength Index."""
+    if len(closes) < period + 1:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    recent = deltas[-(period):]
+    gains = [d if d > 0 else 0 for d in recent]
+    losses = [-d if d < 0 else 0 for d in recent]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _atr(highs, lows, closes, period=14):
+    """Average True Range."""
+    if len(closes) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        h, l, cp = highs[i], lows[i], closes[i - 1]
+        tr = max(h - l, abs(h - cp), abs(l - cp))
+        trs.append(tr)
+    return sum(trs[-period:]) / period if len(trs) >= period else None
+
+
+def _bollinger(closes, period=20, std_mult=2):
+    """Bollinger Bands: upper, middle, lower."""
+    if len(closes) < period:
+        return None, None, None
+    window = closes[-period:]
+    mid = sum(window) / period
+    variance = sum((x - mid) ** 2 for x in window) / period
+    std = variance ** 0.5
+    return round(mid + std_mult * std, 2), round(mid, 2), round(mid - std_mult * std, 2)
+
+
+def _swing_levels(highs, lows, lookback=5):
+    """Find recent swing high/low levels for support/resistance."""
+    supports, resistances = [], []
+    if len(highs) < lookback * 2 + 1:
+        return supports, resistances
+    for i in range(lookback, len(highs) - lookback):
+        # swing high: higher than lookback bars on both sides
+        if highs[i] == max(highs[i - lookback:i + lookback + 1]):
+            resistances.append(round(highs[i], 2))
+        # swing low: lower than lookback bars on both sides
+        if lows[i] == min(lows[i - lookback:i + lookback + 1]):
+            supports.append(round(lows[i], 2))
+    # Return most recent 5 levels, deduplicated
+    supports = sorted(set(supports))[-5:]
+    resistances = sorted(set(resistances))[-5:]
+    return supports, resistances
 
 
 async def _try(client, url, params=None):
@@ -61,8 +132,12 @@ async def collect_market_data():
                         {"symbol": sym, "period": period, "limit": 24})
         taker = await _try(c, f"{base}/futures/data/takerlongshortRatio",
                            {"symbol": sym, "period": period, "limit": 24})
+        # NEW: orderbook depth
+        book = await _try(c, f"{base}/fapi/v1/depth",
+                          {"symbol": sym, "limit": 20})
         fng = await _try(c, FNG)
-    return {"klines": klines, "prem": prem, "oi": oi, "ls": ls, "taker": taker, "fng": fng}
+    return {"klines": klines, "prem": prem, "oi": oi, "ls": ls,
+            "taker": taker, "book": book, "fng": fng}
 
 
 def build_snapshot(raw, account):
@@ -96,6 +171,17 @@ def build_snapshot(raw, account):
     vol_prev = sum(vols[-2 * n24:-n24]) if vols and len(vols) >= 2 * n24 else None
     volchg = ((vol_now - vol_prev) / vol_prev * 100) if (vol_now is not None and vol_prev) else None
 
+    # ---- NEW: Technical Indicators ----
+    rsi_14 = _rsi(closes, 14)
+    ema_12 = _ema(closes, 12)
+    ema_26 = _ema(closes, 26)
+    macd_line = round(ema_12 - ema_26, 2) if (ema_12 is not None and ema_26 is not None) else None
+    atr_14 = _atr(highs, lows, closes, 14)
+    bb_upper, bb_mid, bb_lower = _bollinger(closes, 20, 2)
+
+    # ---- NEW: Support/Resistance levels ----
+    supports, resistances = _swing_levels(highs, lows, 5)
+
     # ---- premiumIndex: mark + funding riil ----
     prem = raw.get("prem") or {}
     frate = _num(prem.get("lastFundingRate"))
@@ -103,7 +189,7 @@ def build_snapshot(raw, account):
     if frate is None:
         gaps.append("funding_rate")
 
-    # ---- open interest hist: [{sumOpenInterest, sumOpenInterestValue, timestamp}] ----
+    # ---- open interest hist ----
     oi_list = raw.get("oi") or []
     oi_last = _num(oi_list[-1].get("sumOpenInterest")) if oi_list else None
     oi_first = _num(oi_list[0].get("sumOpenInterest")) if oi_list else None
@@ -111,7 +197,7 @@ def build_snapshot(raw, account):
     if not oi_list:
         gaps.append("open_interest")
 
-    # ---- global long/short account ratio: [{longAccount, shortAccount, longShortRatio}] ----
+    # ---- global long/short account ratio ----
     ls_list = raw.get("ls") or []
     ls_last = ls_list[-1] if ls_list else {}
     long_pct = _num(ls_last.get("longAccount"))
@@ -119,11 +205,24 @@ def build_snapshot(raw, account):
     if not ls_list:
         gaps.append("long_short_ratio")
 
-    # ---- taker buy/sell ratio: [{buySellRatio, buyVol, sellVol}] ----
+    # ---- taker buy/sell ratio ----
     tk_list = raw.get("taker") or []
     taker_ratio = _num(tk_list[-1].get("buySellRatio")) if tk_list else None
     if taker_ratio is None:
         gaps.append("taker_ratio")
+
+    # ---- NEW: orderbook depth ----
+    book_raw = raw.get("book") or {}
+    bids = book_raw.get("bids") or []
+    asks = book_raw.get("asks") or []
+    bid_depth = sum(_num(b[1]) or 0 for b in bids[:10]) if bids else None
+    ask_depth = sum(_num(a[1]) or 0 for a in asks[:10]) if asks else None
+    bid_ask_ratio = round(bid_depth / ask_depth, 3) if (bid_depth and ask_depth and ask_depth > 0) else None
+    best_bid = _num(bids[0][0]) if bids else None
+    best_ask = _num(asks[0][0]) if asks else None
+    spread_pct = round((best_ask - best_bid) / best_bid * 100, 4) if (best_bid and best_ask) else None
+    if not bids:
+        gaps.append("orderbook")
 
     fng = ((raw.get("fng") or {}).get("data") or [{}])[0]
     if _num(fng.get("value")) is None:
@@ -141,6 +240,23 @@ def build_snapshot(raw, account):
             "last": last, "mark": mark, "change_24h_pct": chg24, "high_24h": h24, "low_24h": l24,
             "range_pos_pct": rng, "sma20": sma20, "sma50": sma50, "trend": trend,
             "volume_24h_base": vol_now, "volume_change_pct": volchg,
+        },
+        "technicals": {
+            "rsi_14": rsi_14,
+            "ema_12": round(ema_12, 2) if ema_12 else None,
+            "ema_26": round(ema_26, 2) if ema_26 else None,
+            "macd_line": macd_line,
+            "atr_14": round(atr_14, 2) if atr_14 else None,
+            "bollinger": {"upper": bb_upper, "mid": bb_mid, "lower": bb_lower},
+            "support_levels": supports,
+            "resistance_levels": resistances,
+        },
+        "orderbook": {
+            "best_bid": best_bid, "best_ask": best_ask,
+            "spread_pct": spread_pct,
+            "bid_depth_top10": round(bid_depth, 4) if bid_depth else None,
+            "ask_depth_top10": round(ask_depth, 4) if ask_depth else None,
+            "bid_ask_ratio": bid_ask_ratio,
         },
         "funding": {"rate": frate,
                     "rate_pct_8h": (frate * 100) if frate is not None else None,
