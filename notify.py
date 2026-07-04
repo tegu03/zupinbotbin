@@ -114,6 +114,9 @@ def format_trade(decision, account, exec_result):
         elif prot.get("closed"):
             lines.append(f"⚡ <b>Posisi ditutup MARKET</b> — {_esc(prot.get('reason'))} "
                          "(SL/TP sudah terpenuhi saat pemasangan)")
+        elif prot.get("mode") == "synthetic":
+            lines.append("🛡️ <b>Proteksi SL/TP: MODE SINTETIS</b> (dipantau bot, tutup MARKET saat harga kena)\n"
+                         "   ⚠️ hanya aktif selama bot hidup — bukan order tersimpan di exchange")
         elif prot.get("ok"):
             if prot.get("tp_verified") is False:
                 lines.append(f"🛡️ <b>SL terpasang &amp; TERVERIFIKASI</b> · ⚠️ TP gagal "
@@ -154,7 +157,7 @@ def format_notrade(decision, account):
 
 
 def format_guardian(actions, phase=""):
-    icon = {"PROTECTED": "✅", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓",
+    icon = {"PROTECTED": "✅", "PROTECTED_SYNTH": "🛰️", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓",
             "NAKED_NO_ENTRY_PRICE": "⚠️", "CLOSED_BREACH": "⚡"}
     head = "🛡️ <b>GUARDIAN</b>" + (f" <i>({_esc(phase)})</i>" if phase else "") + " — proteksi posisi:"
     lines = [head]
@@ -176,7 +179,9 @@ def format_online():
             f"• Gerbang: conf ≥ {CONFIG.min_confidence:g}% · R:R ≥ {CONFIG.min_rr:g} · "
             f"stop ≥ {CONFIG.min_stop_pct * 100:.2f}% · trend-only · min-notional aware\n"
             f"• Kill switch: -{CONFIG.daily_loss_limit_pct * 100:g}%/hari → flatten + pause s.d. "
-            f"{(CONFIG.resume_hour + 7) % 24:02d}:00 WIB · Profit lock: +{CONFIG.daily_profit_target_pct * 100:g}%")
+            f"{(CONFIG.resume_hour + 7) % 24:02d}:00 WIB · Profit lock: +{CONFIG.daily_profit_target_pct * 100:g}%\n"
+            f"• Proteksi: mode <b>{CONFIG.protection_mode}</b>"
+            + (" (native→reduceOnly→sintetis)" if CONFIG.protection_mode == "auto" else ""))
 
 
 def format_position_guard(pos, account):
