@@ -472,6 +472,12 @@ class Exchange:
             return "synthetic"
         return None
 
+    def synth_status(self):
+        """Dict proteksi sintetis aktif {'sl','tp','close_side','is_long'} atau None."""
+        if self._synth and self._synth_task and not self._synth_task.done():
+            return dict(self._synth)
+        return None
+
     async def _arm_protection(self, sl_trigger, tp_trigger, close_side):
         """Inti proteksi (mode-aware). native -> reduceOnly -> sintetis (mode auto)."""
         is_long = (close_side == "SELL")
