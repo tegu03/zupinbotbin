@@ -74,6 +74,14 @@ class Config:
     verify_timeout_sec: float = _f("PROTECT_VERIFY_TIMEOUT_SEC", "3")
     verify_interval_sec: float = _f("PROTECT_VERIFY_INTERVAL_SEC", "0.5")
     leg_retry: int = _i("PROTECT_LEG_RETRY", "4")
+    # --- Protection mode (v4.3) ---
+    # native    = order kondisional exchange (STOP_MARKET/TP_MARKET) -- persist walau bot mati,
+    #             TAPI ditolak -4120 di sebagian venue (mis. demo.binance.com)
+    # synthetic = SL/TP dipantau bot, tutup MARKET reduceOnly saat harga kena -- jalan di semua
+    #             venue, TAPI proteksi HILANG kalau proses bot mati
+    # auto      = coba native (closePosition -> reduceOnly+qty); kalau -4120 -> fallback synthetic
+    protection_mode: str = os.getenv("PROTECTION_MODE", "auto")
+    synth_poll_sec: float = _f("SYNTH_POLL_SEC", "3")
     dry_run: bool = _b("DRY_RUN", "true")
     loop_minutes: int = _i("LOOP_MINUTES", "15")
     notify_every_cycle: bool = _b("NOTIFY_EVERY_CYCLE", "true")
