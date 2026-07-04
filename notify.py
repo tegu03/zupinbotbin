@@ -184,11 +184,25 @@ def format_online():
             + (" (native→reduceOnly→sintetis)" if CONFIG.protection_mode == "auto" else ""))
 
 
-def format_position_guard(pos, account):
+def format_position_guard(pos, account, protection=None, synth=None, mark=None):
     lines = [_header(account), ""]
     lines.append("⏸️ <b>Posisi masih terbuka — entry baru diblokir</b> (guard)")
     lines.append(f"• Size: {_esc(pos.get('size'))} @ ${_f(pos.get('entry_price'))}")
-    lines.append("• SL/TP di exchange tetap aktif · bot menunggu posisi selesai")
+    if synth:
+        sl, tp = synth.get("sl"), synth.get("tp")
+        line = f"🛰️ <b>Proteksi SL/TP: MODE SINTETIS</b> — SL ${_f(sl)} · TP ${_f(tp)}"
+        if mark is not None:
+            line += f" · mark ${_f(mark)}"
+        lines.append(line)
+        lines.append("• ⚠️ TIDAK muncul di Open Orders exchange — ini NORMAL untuk mode sintetis "
+                     "(bot yang memantau &amp; menutup MARKET saat kena)")
+        lines.append("• Proteksi aktif hanya selama bot hidup")
+    elif protection == "native_full":
+        lines.append("🛡️ <b>SL+TP conditional AKTIF di exchange</b> (cek tab Open Orders)")
+    elif protection == "native_partial":
+        lines.append("⚠️ <b>Hanya sebagian proteksi native di exchange</b> — guardian melengkapi siklus ini")
+    else:
+        lines.append("❌ <b>Status proteksi BELUM terverifikasi</b> — cek log guardian / posisi mungkin telanjang")
     lines.append("")
     lines.append(f"<i>Bukan nasihat finansial · Binance {_venue()}</i>")
     return "\n".join(lines)
