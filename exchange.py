@@ -245,20 +245,183 @@ class Exchange:
                 with contextlib.suppress(Exception):
                     await self.c.sdelete("/fapi/v1/order", symbol=CONFIG.symbol, orderId=o.get("orderId"))
 
-    # ---- protection: SL + TP conditional, closePosition=true ----
-    async def _protect(self, sl_trigger, tp_trigger, close_side):
+    # ================= PROTECTION SUBSYSTEM (v4.2 -- reliable SL/TP) =================
+    # Alur: WAIT POSITION READY -> cek breach vs MARK -> PLACE SL -> VERIFY -> PLACE TP
+    # -> VERIFY. Retry berbasis state (refresh mark tiap percobaan). Kalau trigger sudah
+    # dilewati mark (mis. error -2021 "would immediately trigger") -> MARKET close, bukan
+    # mengirim order mustahil. Kalau SL tak bisa terpasang -> EMERGENCY close (tak telanjang).
+
+    async def mark_price(self):
+        with contextlib.suppress(Exception):
+            r = await self.c.get("/fapi/v1/premiumIndex", symbol=CONFIG.symbol)
+            m = float(r.get("markPrice") or 0)
+            return m or None
+        return None
+
+    async def _position_risk(self):
+        """(positionAmt, entryPrice, markPrice) langsung dari /fapi/v2/positionRisk."""
+        data = await self.c.sget("/fapi/v2/positionRisk", symbol=CONFIG.symbol)
+        row = None
+        if isinstance(data, list):
+            row = next((r for r in data if r.get("symbol") == CONFIG.symbol), None)
+        elif isinstance(data, dict):
+            row = data
+        if not row:
+            return 0.0, 0.0, None
+        amt = float(row.get("positionAmt") or 0)
+        entry = float(row.get("entryPrice") or 0)
+        mark = float(row.get("markPrice") or 0) or None
+        return amt, entry, mark
+
+    async def _wait_position(self):
+        """Tunggu posisi BENAR-BENAR aktif (positionAmt != 0 & entryPrice > 0) sebelum
+        memasang proteksi. Menutup race condition: FILLED != posisi langsung queryable."""
+        deadline = time.time() + CONFIG.position_wait_timeout_sec
+        amt = entry = 0.0
+        mark = None
+        while time.time() < deadline:
+            with contextlib.suppress(Exception):
+                amt, entry, mark = await self._position_risk()
+            if amt != 0 and entry > 0:
+                return amt, entry, (mark or await self.mark_price())
+            await asyncio.sleep(CONFIG.position_wait_interval_sec)
+        return amt, entry, (mark or await self.mark_price())
+
+    @staticmethod
+    def _order_kind(o):
+        typ = str(o.get("type") or o.get("origType") or "")
+        if typ in ("STOP_MARKET", "STOP"):
+            return "sl"
+        if typ in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+            return "tp"
+        return None
+
+    async def _open_protective_map(self):
+        """{'sl': order|None, 'tp': order|None} dari open orders yang protektif."""
+        out = {"sl": None, "tp": None}
+        for o in await self.open_orders():
+            if not self._is_protective(o):
+                continue
+            k = self._order_kind(o)
+            if k and out.get(k) is None:
+                out[k] = o
+        return out
+
+    @staticmethod
+    def _breached(kind, is_long, mark, trigger):
+        """True jika mark sudah melewati sisi pemicu (order akan langsung trigger = -2021)."""
+        if mark is None:
+            return False
+        if kind == "sl":
+            return mark <= trigger if is_long else mark >= trigger
+        return mark >= trigger if is_long else mark <= trigger
+
+    async def _place_one(self, kind, side, trigger):
+        otype = "STOP_MARKET" if kind == "sl" else "TAKE_PROFIT_MARKET"
+        t0 = time.time()
         try:
-            await self.c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=close_side,
-                               type="STOP_MARKET", stopPrice=self.fmt_price(sl_trigger),
-                               closePosition="true", workingType="MARK_PRICE",
-                               newClientOrderId=f"zb-sl-{int(time.time()*1000)}")
-            await self.c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=close_side,
-                               type="TAKE_PROFIT_MARKET", stopPrice=self.fmt_price(tp_trigger),
-                               closePosition="true", workingType="MARK_PRICE",
-                               newClientOrderId=f"zb-tp-{int(time.time()*1000)}")
-            return {"ok": True}
+            r = await self.c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=side,
+                                   type=otype, stopPrice=self.fmt_price(trigger),
+                                   closePosition="true", workingType="MARK_PRICE",
+                                   newClientOrderId=f"zb-{kind}-{int(time.time()*1000)}")
+            return {"ok": True, "orderId": r.get("orderId"),
+                    "latency_ms": int((time.time() - t0) * 1000)}
+        except BinanceError as e:
+            return {"ok": False, "code": e.code, "error": e.msg,
+                    "latency_ms": int((time.time() - t0) * 1000)}
         except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            return {"ok": False, "code": None, "error": f"{type(e).__name__}: {e}",
+                    "latency_ms": int((time.time() - t0) * 1000)}
+
+    async def _verify_leg(self, kind):
+        """Pastikan leg benar-benar ADA di open orders (bukan sekadar submit sukses)."""
+        deadline = time.time() + CONFIG.verify_timeout_sec
+        while time.time() < deadline:
+            with contextlib.suppress(Exception):
+                if (await self._open_protective_map()).get(kind):
+                    return True
+            await asyncio.sleep(CONFIG.verify_interval_sec)
+        return False
+
+    async def _ensure_leg(self, kind, side, trigger, is_long):
+        """Pasang SATU leg (sl/tp) sampai TERVERIFIKASI. State-based retry (refresh mark).
+        Return breached=True jika mark sudah melewati trigger (caller -> MARKET close)."""
+        with contextlib.suppress(Exception):
+            if (await self._open_protective_map()).get(kind):
+                return {"ok": True, "verified": True, "existing": True}
+        last = code = None
+        for attempt in range(1, CONFIG.leg_retry + 1):
+            mark = await self.mark_price()
+            if self._breached(kind, is_long, mark, trigger):
+                return {"ok": False, "breached": True, "mark": mark}
+            res = await self._place_one(kind, side, trigger)
+            if res.get("ok"):
+                if await self._verify_leg(kind):
+                    log.info("PROTECT %s VERIFIED trigger=%s orderId=%s latency=%sms attempt=%d",
+                             kind.upper(), self.fmt_price(trigger), res.get("orderId"),
+                             res.get("latency_ms"), attempt)
+                    return {"ok": True, "verified": True, "orderId": res.get("orderId"),
+                            "attempts": attempt, "latency_ms": res.get("latency_ms")}
+                last, code = "placed_but_not_verified", None
+                log.warning("PROTECT %s submit OK tapi TIDAK terverifikasi (attempt %d/%d)",
+                            kind.upper(), attempt, CONFIG.leg_retry)
+            else:
+                last, code = res.get("error"), res.get("code")
+                log.warning("PROTECT %s FAILED code=%s msg=%s (attempt %d/%d)",
+                            kind.upper(), code, last, attempt, CONFIG.leg_retry)
+                if code == -2021:  # would immediately trigger -> mark sudah lewat trigger
+                    return {"ok": False, "breached": True, "code": -2021,
+                            "error": last, "mark": await self.mark_price()}
+            await asyncio.sleep(CONFIG.protect_retry_backoff_sec)
+        return {"ok": False, "verified": False, "last_error": last, "code": code}
+
+    async def _arm_protection(self, sl_trigger, tp_trigger, close_side):
+        """Inti proteksi. Dipanggil execute (entry), watcher (limit fill), guardian."""
+        is_long = (close_side == "SELL")
+        amt, entry, mark = await self._wait_position()
+        if amt == 0:
+            log.error("PROTECT abort: posisi belum aktif setelah %ss (race / entry gagal)",
+                      CONFIG.position_wait_timeout_sec)
+            return {"ok": False, "attempts": 0, "last_error": "position_not_ready"}
+        log.info("PROTECT begin entry=%.4f qty=%s mark=%s SL=%s TP=%s close_side=%s",
+                 entry, amt, mark, self.fmt_price(sl_trigger), self.fmt_price(tp_trigger), close_side)
+
+        if self._breached("sl", is_long, mark, sl_trigger):
+            r = await self.close_position_market()
+            log.warning("PROTECT: SL sudah breached (mark=%s, trigger=%s) -> MARKET close",
+                        mark, self.fmt_price(sl_trigger))
+            out = {"ok": bool(r.get("ok")), "closed": True, "reason": "sl_breached_preplace", "attempts": 1}
+            if not r.get("ok"):
+                out["last_error"] = r.get("error")
+            return out
+        if self._breached("tp", is_long, mark, tp_trigger):
+            r = await self.close_position_market()
+            log.warning("PROTECT: TP sudah tercapai (mark=%s) -> MARKET close (profit)", mark)
+            out = {"ok": bool(r.get("ok")), "closed": True, "reason": "tp_breached_preplace", "attempts": 1}
+            if not r.get("ok"):
+                out["last_error"] = r.get("error")
+            return out
+
+        sl = await self._ensure_leg("sl", close_side, sl_trigger, is_long)
+        if sl.get("breached"):
+            r = await self.close_position_market()
+            return {"ok": bool(r.get("ok")), "closed": True, "reason": "sl_breached",
+                    "attempts": sl.get("attempts", 1)}
+        if not sl.get("ok"):
+            out = {"ok": False, "attempts": CONFIG.leg_retry, "leg_failed": "sl",
+                   "last_error": sl.get("last_error"), "code": sl.get("code")}
+            if CONFIG.emergency_close_if_unprotected:
+                out["emergency_close"] = await self.close_position_market()
+            return out
+
+        tp = await self._ensure_leg("tp", close_side, tp_trigger, is_long)
+        if tp.get("breached"):
+            r = await self.close_position_market()  # SL closePosition auto-cancel saat flat
+            return {"ok": bool(r.get("ok")), "closed": True, "reason": "tp_breached", "sl_verified": True}
+        return {"ok": True, "attempts": sl.get("attempts", 1),
+                "sl_verified": True, "tp_verified": bool(tp.get("ok")),
+                "tp_error": None if tp.get("ok") else tp.get("last_error"),
+                "tp_code": None if tp.get("ok") else tp.get("code")}
 
     async def close_position_market(self):
         """Tutup posisi simbol ini sekarang (MARKET reduce-only)."""
@@ -279,25 +442,13 @@ class Exchange:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     async def _protect_with_retry(self, sl_trigger, tp_trigger, close_side):
-        last = None
-        for attempt in range(1, CONFIG.protect_max_retries + 1):
-            with contextlib.suppress(Exception):
-                await self._cancel_protective()  # cegah duplikat SL/TP antar-percobaan
-            res = await self._protect(sl_trigger, tp_trigger, close_side)
-            if res.get("ok"):
-                return {"ok": True, "attempts": attempt}
-            last = res.get("error")
-            log.warning("protect attempt %d/%d failed: %s", attempt, CONFIG.protect_max_retries, last)
-            await asyncio.sleep(CONFIG.protect_retry_backoff_sec)
-
-        out = {"ok": False, "attempts": CONFIG.protect_max_retries, "last_error": last}
-        if CONFIG.emergency_close_if_unprotected:
-            log.error("protection failed -> EMERGENCY CLOSE (reduce-only)")
-            out["emergency_close"] = await self.close_position_market()
-        return out
+        """Wrapper kompatibilitas -> subsistem proteksi baru (_arm_protection)."""
+        return await self._arm_protection(sl_trigger, tp_trigger, close_side)
 
     # ---- GUARDIAN ----
     async def ensure_protection(self, account):
+        """Guardian IDEMPOTENT: cek SL & TP terpisah, pasang HANYA yang hilang.
+        Tidak pernah menghapus order proteksi yang sudah benar."""
         actions = []
         if not CONFIG.guardian_enabled or CONFIG.dry_run or not CONFIG.binance_api_key:
             return actions
@@ -305,23 +456,43 @@ class Exchange:
         if not pos:
             return actions
         try:
-            orders = await self.open_orders()
+            pmap = await self._open_protective_map()
         except Exception as e:
             return [{"market": CONFIG.symbol, "status": "UNVERIFIED", "detail": str(e)}]
-        if any(self._is_protective(o) for o in orders):
-            return actions
+        have_sl, have_tp = bool(pmap.get("sl")), bool(pmap.get("tp"))
+        if have_sl and have_tp:
+            return actions  # sudah terproteksi penuh -> no-op
         entry_px = float(pos.get("entry_price") or 0)
         if entry_px <= 0:
             return [{"market": CONFIG.symbol, "status": "NAKED_NO_ENTRY_PRICE"}]
         is_long = self._position_is_long(pos)
         sp = CONFIG.guardian_stop_pct
+        close_side = "SELL" if is_long else "BUY"
         if is_long:
-            sl, tp, side = entry_px * (1 - sp), entry_px * (1 + sp * CONFIG.min_rr), "SELL"
+            sl_t, tp_t = entry_px * (1 - sp), entry_px * (1 + sp * CONFIG.min_rr)
         else:
-            sl, tp, side = entry_px * (1 + sp), entry_px * (1 - sp * CONFIG.min_rr), "BUY"
-        res = await self._protect_with_retry(sl, tp, side)
-        actions.append({"market": CONFIG.symbol,
-                        "status": "PROTECTED" if res.get("ok") else "STILL_NAKED", **res})
+            sl_t, tp_t = entry_px * (1 + sp), entry_px * (1 - sp * CONFIG.min_rr)
+
+        if not have_sl and not have_tp:
+            res = await self._arm_protection(sl_t, tp_t, close_side)
+            actions.append({"market": CONFIG.symbol, "placed": "both",
+                            "status": "PROTECTED" if res.get("ok") else "STILL_NAKED", **res})
+            return actions
+
+        missing = "sl" if not have_sl else "tp"
+        trig = sl_t if missing == "sl" else tp_t
+        leg = await self._ensure_leg(missing, close_side, trig, is_long)
+        if leg.get("breached"):
+            r = await self.close_position_market()
+            actions.append({"market": CONFIG.symbol, "placed": missing,
+                            "status": "CLOSED_BREACH" if r.get("ok") else "STILL_NAKED"})
+        else:
+            row = {"market": CONFIG.symbol, "placed": missing,
+                   "status": "PROTECTED" if leg.get("ok") else "STILL_NAKED"}
+            if not leg.get("ok"):
+                row["last_error"] = leg.get("last_error")
+                row["code"] = leg.get("code")
+            actions.append(row)
         return actions
 
     # ---- kill switch: flatten semuanya ----
@@ -375,14 +546,20 @@ class Exchange:
     async def _watcher_notify(self, decision, prot):
         with contextlib.suppress(Exception):
             from notify import send  # lazy import
-            if prot.get("ok"):
-                msg = (f"🛡️ <b>Limit terisi → SL/TP terpasang</b> (watcher · percobaan {prot.get('attempts')})\n"
+            if prot.get("closed"):
+                leg = "SL" if "sl" in str(prot.get("reason")) else "TP"
+                msg = (f"⚡ <b>Limit terisi, {leg} sudah terpenuhi saat pemasangan → posisi DITUTUP MARKET</b>\n"
+                       f"• alasan: {prot.get('reason')}")
+            elif prot.get("ok"):
+                tp_txt = "SL+TP" if prot.get("tp_verified", True) else "SL (TP gagal, guardian retry)"
+                msg = (f"🛡️ <b>Limit terisi → {tp_txt} TERVERIFIKASI</b> (watcher)\n"
                        f"• SL ${decision['stop']:,.1f} · TP ${decision['tp1']:,.1f}")
             elif (prot.get("emergency_close") or {}).get("ok"):
-                msg = "🚨 <b>Limit terisi tapi SL/TP GAGAL → posisi ditutup darurat</b> (reduce-only)"
+                msg = ("🚨 <b>Limit terisi tapi SL GAGAL → posisi ditutup darurat</b> (reduce-only)\n"
+                       f"• Binance code={prot.get('code')} {prot.get('last_error')}")
             else:
-                msg = ("⚠️ <b>Limit terisi, SL/TP GAGAL, tutup darurat tak terkonfirmasi — CEK POSISI MANUAL!</b>\n"
-                       f"• error: {prot.get('last_error')}")
+                msg = ("⚠️ <b>Limit terisi, SL GAGAL, tutup darurat tak terkonfirmasi — CEK MANUAL!</b>\n"
+                       f"• Binance code={prot.get('code')} {prot.get('last_error')}")
             await send(msg)
 
     # ---- execution ----
