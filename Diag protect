@@ -1,0 +1,156 @@
+"""Diagnosa proteksi ZupinBot — jawab AKAR masalah SL/TP secara pasti (raw response).
+
+Jalankan SAAT ada posisi kecil manual terbuka (mis. 0.002 BTC) di venue yang sama:
+    python diag_protect.py            # non-destruktif: tes native STOP + tes tulis LIMIT
+    python diag_protect.py --close    # JUGA tes MARKET reduceOnly close (MENUTUP posisi!)
+
+Yang dijawab:
+  1. Base URL & environment mana yang benar-benar dipakai bot (demo vs testnet).
+  2. Auth valid? saldo? -> memastikan akun yang sama dengan yang kamu lihat di browser.
+  3. Position mode One-way?
+  4. Native STOP_MARKET DITERIMA atau -4120? (dua varian: closePosition & reduceOnly+qty)
+     -> ini menentukan apakah PROTECTION_MODE=native mungkin, atau harus synthetic.
+  5. Tulis order dasar (LIMIT) bekerja? -> memastikan API key punya izin order.
+  6. [--close] MARKET reduceOnly benar-benar mengeksekusi? -> LINCHPIN: synthetic SL,
+     kill switch, dan emergency close SEMUA bergantung pada ini. Kalau gagal, tidak ada
+     proteksi apa pun yang berfungsi.
+"""
+import sys
+import asyncio
+import math
+
+from config import CONFIG
+from binance_client import BinanceClient, BinanceError
+
+
+def _fmt(v, dec):
+    step = 10 ** (-dec)
+    x = math.floor(float(v) / step + 1e-9) * step
+    return f"{x:.{dec}f}"
+
+
+async def main():
+    close_test = "--close" in sys.argv
+    print("=" * 64)
+    print("DIAGNOSA PROTEKSI SL/TP")
+    print("=" * 64)
+    print(f"Base eksekusi : {CONFIG.binance_base}")
+    print(f"Base data     : {CONFIG.binance_data_base}")
+    print(f"Symbol        : {CONFIG.symbol}")
+    print(f"PROTECTION_MODE (config): {CONFIG.protection_mode}")
+    print("-" * 64)
+
+    c = BinanceClient()
+    await c.start()
+    try:
+        # --- filter market (tick/step) ---
+        info = await c.get("/fapi/v1/exchangeInfo")
+        sym = next((s for s in info.get("symbols", []) if s.get("symbol") == CONFIG.symbol), None)
+        if not sym:
+            print(f"GAGAL: {CONFIG.symbol} tak ada di exchangeInfo. Base URL salah?")
+            return
+        filt = {x["filterType"]: x for x in sym.get("filters", [])}
+        tick = float(filt.get("PRICE_FILTER", {}).get("tickSize", "0.1"))
+        step = float(filt.get("LOT_SIZE", {}).get("stepSize", "0.001"))
+        price_dec = len(f"{tick:.10f}".rstrip("0").split(".")[1]) if "." in f"{tick:.10f}".rstrip("0") else 0
+        size_dec = len(f"{step:.10f}".rstrip("0").split(".")[1]) if "." in f"{step:.10f}".rstrip("0") else 0
+        print(f"tick={tick} step={step}")
+
+        # --- auth + saldo (environment check) ---
+        if not CONFIG.binance_api_key:
+            print("API key belum di-set — stop.")
+            return
+        bal = await c.sget("/fapi/v2/balance")
+        usdt = next((b for b in bal if b.get("asset") == "USDT"), {})
+        print(f"Saldo USDT    : {usdt.get('balance')} (available {usdt.get('availableBalance')})")
+        print("  -> cocokkan dengan saldo yang kamu lihat di browser. Beda = akun/venue beda.")
+        dual = await c.sget("/fapi/v1/positionSide/dual")
+        print(f"Position mode : {'HEDGE (ubah ke One-way!)' if str(dual.get('dualSidePosition')).lower()=='true' else 'One-way (OK)'}")
+
+        # --- mark price + posisi saat ini ---
+        prem = await c.get("/fapi/v1/premiumIndex", symbol=CONFIG.symbol)
+        mark = float(prem.get("markPrice") or 0)
+        pr = await c.sget("/fapi/v2/positionRisk", symbol=CONFIG.symbol)
+        row = next((r for r in pr if r.get("symbol") == CONFIG.symbol), None) if isinstance(pr, list) else pr
+        amt = float((row or {}).get("positionAmt") or 0)
+        entry = float((row or {}).get("entryPrice") or 0)
+        print("-" * 64)
+        print(f"Mark price    : {mark}")
+        print(f"Posisi        : positionAmt={amt} entryPrice={entry}")
+        if amt == 0:
+            print("\n⚠️  TIDAK ADA posisi terbuka. Buka 0.002 BTC manual dulu di UI, lalu jalankan lagi.")
+            print("   (Tes STOP & MARKET-close butuh posisi nyata untuk hasil valid.)")
+            return
+
+        is_long = amt > 0
+        close_side = "SELL" if is_long else "BUY"
+        # trigger jauh dari mark supaya TIDAK langsung trigger saat tes (non-destruktif)
+        sl_trigger = mark * (0.90 if is_long else 1.10)
+        qty_str = _fmt(abs(amt), size_dec)
+
+        # ---- TES 4a: STOP_MARKET closePosition ----
+        print("-" * 64)
+        print("TES native STOP_MARKET (closePosition=true):")
+        try:
+            r = await c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=close_side,
+                              type="STOP_MARKET", stopPrice=_fmt(sl_trigger, price_dec),
+                              closePosition="true", workingType="MARK_PRICE")
+            print(f"  ✅ DITERIMA -> orderId={r.get('orderId')} (native BISA! set PROTECTION_MODE=native)")
+            await c.sdelete("/fapi/v1/order", symbol=CONFIG.symbol, orderId=r.get("orderId"))
+            print("  (order tes dibatalkan)")
+        except BinanceError as e:
+            print(f"  ❌ DITOLAK -> code={e.code} msg={e.msg}")
+
+        # ---- TES 4b: STOP_MARKET reduceOnly + quantity ----
+        print("TES native STOP_MARKET (reduceOnly + quantity):")
+        try:
+            r = await c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=close_side,
+                              type="STOP_MARKET", stopPrice=_fmt(sl_trigger, price_dec),
+                              quantity=qty_str, reduceOnly="true", workingType="MARK_PRICE")
+            print(f"  ✅ DITERIMA -> orderId={r.get('orderId')} (native reduceOnly BISA!)")
+            await c.sdelete("/fapi/v1/order", symbol=CONFIG.symbol, orderId=r.get("orderId"))
+            print("  (order tes dibatalkan)")
+        except BinanceError as e:
+            print(f"  ❌ DITOLAK -> code={e.code} msg={e.msg}")
+
+        # ---- TES 5: tulis order dasar (LIMIT jauh) — konfirmasi izin order ----
+        print("TES tulis order dasar (LIMIT jauh dari harga):")
+        limit_px = mark * (0.80 if is_long else 1.20)  # jauh, tak akan terisi
+        try:
+            side = "BUY" if is_long else "SELL"  # arah apa saja; langsung dibatalkan
+            r = await c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=side,
+                              type="LIMIT", timeInForce="GTC",
+                              price=_fmt(limit_px, price_dec), quantity=qty_str)
+            print(f"  ✅ LIMIT diterima -> orderId={r.get('orderId')} (izin order OK)")
+            await c.sdelete("/fapi/v1/order", symbol=CONFIG.symbol, orderId=r.get("orderId"))
+            print("  (order tes dibatalkan)")
+        except BinanceError as e:
+            print(f"  ❌ DITOLAK -> code={e.code} msg={e.msg}")
+
+        # ---- TES 6 (LINCHPIN, opsional): MARKET reduceOnly close ----
+        print("-" * 64)
+        if close_test:
+            print("TES LINCHPIN: MARKET reduceOnly close (MENUTUP posisi):")
+            try:
+                r = await c.spost("/fapi/v1/order", symbol=CONFIG.symbol, side=close_side,
+                                  type="MARKET", quantity=qty_str, reduceOnly="true")
+                print(f"  ✅ MARKET close DITERIMA -> orderId={r.get('orderId')}")
+                print("  -> Synthetic SL, kill switch, emergency close BISA berfungsi.")
+            except BinanceError as e:
+                print(f"  ❌ DITOLAK -> code={e.code} msg={e.msg}")
+                print("  -> BAHAYA: kalau ini gagal, TIDAK ADA mekanisme proteksi yang berfungsi.")
+        else:
+            print("LINCHPIN MARKET-close: DILEWATI (tambah --close untuk menguji; itu menutup posisi).")
+            print("  Tanpa tes ini, 'synthetic protected' belum terbukti bisa benar-benar menutup.")
+
+        print("=" * 64)
+        print("KESIMPULAN cepat:")
+        print("  - Kalau TES 4a/4b ada yang ✅  -> pakai PROTECTION_MODE=native (proteksi persist di exchange).")
+        print("  - Kalau 4a/4b dua-duanya -4120 -> native mustahil di venue ini; andalkan synthetic.")
+        print("  - Synthetic hanya sah kalau TES 6 (--close) ✅. Kalau ❌, semua proteksi mati.")
+    finally:
+        await c.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
