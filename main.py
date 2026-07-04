@@ -108,7 +108,18 @@ async def run_cycle(ex: Exchange):
     if pos is not None and CONFIG.block_if_position_open and not CONFIG.dry_run:
         log.info("open position exists -> new entries blocked this cycle")
         if CONFIG.notify_every_cycle:
-            await send(format_position_guard(pos, account))
+            status = await ex._is_protected()
+            synth = ex.synth_status()
+            mark = await ex.mark_price() if synth else None
+            if status is None:
+                log.warning("position OPEN but UNPROTECTED -> re-arming via guardian")
+                guard_reany = await ex.ensure_protection(account)
+                if guard_reany:
+                    await send(format_guardian(guard_reany, phase="re-arm"))
+                    status = await ex._is_protected()
+                    synth = ex.synth_status()
+                    mark = await ex.mark_price() if synth else None
+            await send(format_position_guard(pos, account, protection=status, synth=synth, mark=mark))
         return
 
     raw = await collect_market_data()
