@@ -108,13 +108,24 @@ def format_trade(decision, account, exec_result):
         if prot.get("deferred"):
             if prot.get("mode") == "watcher":
                 lines.append(f"🛡️ SL/TP menunggu fill — <b>watcher aktif</b> "
-                             f"(cek tiap {int(prot.get('poll_sec') or 20)} dtk)")
+                             f"(cek tiap {int(prot.get('poll_sec') or 5)} dtk)")
             else:
                 lines.append("🛡️ SL/TP menunggu fill — guardian memproteksi di siklus berikutnya")
+        elif prot.get("closed"):
+            lines.append(f"⚡ <b>Posisi ditutup MARKET</b> — {_esc(prot.get('reason'))} "
+                         "(SL/TP sudah terpenuhi saat pemasangan)")
         elif prot.get("ok"):
-            lines.append(f"🛡️ <b>SL/TP terpasang</b> (STOP+TP conditional · percobaan {prot.get('attempts')})")
+            if prot.get("tp_verified") is False:
+                lines.append(f"🛡️ <b>SL terpasang &amp; TERVERIFIKASI</b> · ⚠️ TP gagal "
+                             f"(code {_esc(prot.get('tp_code'))}) — guardian akan retry")
+            else:
+                lines.append("🛡️ <b>SL+TP terpasang &amp; TERVERIFIKASI</b> (conditional closePosition)")
         elif (prot.get("emergency_close") or {}).get("ok"):
-            lines.append("🚨 <b>SL/TP gagal → posisi DITUTUP darurat</b> (reduce-only)")
+            lines.append(f"🚨 <b>SL gagal → posisi DITUTUP darurat</b> (reduce-only) · "
+                         f"Binance code {_esc(prot.get('code'))}: {_esc(prot.get('last_error'))}")
+        elif prot.get("last_error") or prot.get("code"):
+            lines.append(f"❌ <b>SL/TP GAGAL — CEK MANUAL</b> · Binance code {_esc(prot.get('code'))}: "
+                         f"{_esc(prot.get('last_error'))}")
         elif e.get("warning"):
             lines.append(f"⚠️ <b>{_esc(e.get('warning'))}</b>")
         elif not prot:
@@ -143,12 +154,18 @@ def format_notrade(decision, account):
 
 
 def format_guardian(actions, phase=""):
-    icon = {"PROTECTED": "✅", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓", "NAKED_NO_ENTRY_PRICE": "⚠️"}
-    head = "🛡️ <b>GUARDIAN</b>" + (f" <i>({_esc(phase)})</i>" if phase else "") + " — posisi tanpa proteksi:"
+    icon = {"PROTECTED": "✅", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓",
+            "NAKED_NO_ENTRY_PRICE": "⚠️", "CLOSED_BREACH": "⚡"}
+    head = "🛡️ <b>GUARDIAN</b>" + (f" <i>({_esc(phase)})</i>" if phase else "") + " — proteksi posisi:"
     lines = [head]
     for g in actions:
         st = str(g.get("status", "?"))
-        lines.append(f"{icon.get(st, '•')} {_esc(g.get('market'))}: {_esc(st)}")
+        extra = ""
+        if g.get("placed"):
+            extra += f" · pasang {_esc(g.get('placed'))}"
+        if g.get("last_error") or g.get("code"):
+            extra += f" · code {_esc(g.get('code'))}: {_esc(g.get('last_error'))}"
+        lines.append(f"{icon.get(st, '•')} {_esc(g.get('market'))}: {_esc(st)}{extra}")
     return "\n".join(lines)
 
 
