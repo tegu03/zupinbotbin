@@ -1,12 +1,16 @@
-"""Telegram notifications v4 (Binance). Emoji = sinyal STATUS, bukan dekorasi.
-Kejujuran tampilan: order gagal tidak boleh tampak sukses; limit resting BUKAN
-'terisi'; venue (TESTNET/MAINNET) selalu terlihat; conf hanya bila bermakna."""
+"""Telegram notifications (HTML + emoji as STATUS signals, not decoration).
+
+Design choices:
+  - parse_mode=HTML so labels can be bold; send() falls back to plain text if a
+    message ever contains bad HTML, so a formatting glitch never eats an alert.
+  - Emoji encode STATUS at a glance: green/red for PnL sign, checkmark/cross for
+    fill vs fail, shield for protected, siren for emergency-close. A failed order
+    must never look like a successful one.
+  - Dynamic content (errors, reasons) is HTML-escaped. Numbers are safe as-is.
+  - tx hashes are shortened; NO-TRADE is collapsed to a few lines to avoid spam.
+"""
 import httpx
 from config import CONFIG
-
-
-def _venue():
-    return "MAINNET" if "fapi.binance.com" in CONFIG.binance_base else "TESTNET"
 
 
 async def send(text, parse_mode="HTML"):
@@ -21,12 +25,14 @@ async def send(text, parse_mode="HTML"):
         try:
             r = await c.post(url, json=payload, timeout=20)
             if r.status_code != 200 and parse_mode:
+                # Most likely an HTML parse error -> resend as plain text so the alert still lands.
                 payload.pop("parse_mode", None)
                 await c.post(url, json=payload, timeout=20)
         except Exception as e:
             print("[notify] send failed:", e)
 
 
+# ---- helpers ----
 def _esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -52,17 +58,17 @@ def _dot(x):
         return "⚪"
 
 
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
+def _short(h):
+    h = str(h or "")
+    if h.startswith("DRYRUN") or len(h) <= 14:
+        return h
+    return f"{h[:6]}…{h[-4:]}"
 
 
 def _header(account):
     a = account
     return "\n".join([
-        f"🤖 <b>Zupin Bot</b> · {CONFIG.symbol} Perp · <b>Binance {_venue()}</b>",
+        "🤖 <b>Zupin Bot</b> · BTC Perp <i>(Lighter Testnet)</i>",
         "",
         "💰 <b>Modal &amp; PnL</b>",
         f"• Equity: <b>${_f(a.get('equity_usd'))}</b>  (awal ${_f(a.get('base_capital_usd'))})",
@@ -74,6 +80,7 @@ def _header(account):
 
 def format_trade(decision, account, exec_result):
     d, e = decision, exec_result
+    cfg = CONFIG
     dir_emoji = "📈" if d.get("signal") == "long" else "📉"
 
     lines = [_header(account), ""]
@@ -85,57 +92,29 @@ def format_trade(decision, account, exec_result):
     if d.get("tp2"):
         tp += f" → ${_f(d.get('tp2'))}"
     lines.append(tp)
-    lines.append(f"• R:R ⚖️ {d.get('rr')} · risk 💵 ${_f(d.get('risk_usd'))} ({CONFIG.risk_pct * 100:g}%)")
-    lines.append(f"• Size 📦 ${_f(d.get('notional_usd'))} · {d.get('base_amount')} {CONFIG.symbol[:-4]}")
-    if d.get("fee_est_usd") is not None:
-        lines.append(f"• Fee est (worst) 🧾 ${_f(d.get('fee_est_usd'))}")
+    lines.append(f"• R:R ⚖️ {d.get('rr')} · risk 💵 ${_f(d.get('risk_usd'))} ({cfg.risk_pct * 100:g}%)")
+    lines.append(f"• Size 📦 ${_f(d.get('notional_usd'))} · {d.get('base_amount')} unit")
     lines.append("")
 
+    # --- execution + protection status (the part that must never mislead) ---
     if d.get("dry_run") or e.get("dry_run"):
         lines.append("🧪 <b>DRY-RUN</b> — tidak ada order dikirim")
     elif not e.get("ok"):
         lines.append(f"❌ <b>Entry GAGAL</b>: {_esc(e.get('error', '?'))}")
     else:
+        lines.append(f"✅ <b>Entry terisi</b> · tx <code>{_esc(_short(e.get('tx_hash')))}</code>")
         prot = e.get("protection") or {}
-        st = e.get("entry_status")
-        if st == "resting":
-            lines.append(f"⏳ <b>Limit dipasang — BELUM terisi</b> · order <code>{_esc(e.get('tx_hash'))}</code>")
-            lines.append("• Disapu otomatis siklus berikutnya jika tak tersentuh")
-        elif st == "partial":
-            lines.append(f"◔ <b>Limit terisi SEBAGIAN</b> · order <code>{_esc(e.get('tx_hash'))}</code>")
-        else:
-            lines.append(f"✅ <b>Entry terisi</b> · order <code>{_esc(e.get('tx_hash'))}</code>")
-        if prot.get("deferred"):
-            if prot.get("mode") == "watcher":
-                lines.append(f"🛡️ SL/TP menunggu fill — <b>watcher aktif</b> "
-                             f"(cek tiap {int(prot.get('poll_sec') or 5)} dtk)")
-            else:
-                lines.append("🛡️ SL/TP menunggu fill — guardian memproteksi di siklus berikutnya")
-        elif prot.get("closed"):
-            lines.append(f"⚡ <b>Posisi ditutup MARKET</b> — {_esc(prot.get('reason'))} "
-                         "(SL/TP sudah terpenuhi saat pemasangan)")
-        elif prot.get("mode") == "synthetic":
-            lines.append("🛡️ <b>Proteksi SL/TP: MODE SINTETIS</b> (dipantau bot, tutup MARKET saat harga kena)\n"
-                         "   ⚠️ hanya aktif selama bot hidup — bukan order tersimpan di exchange")
-        elif prot.get("ok"):
-            if prot.get("tp_verified") is False:
-                lines.append(f"🛡️ <b>SL terpasang &amp; TERVERIFIKASI</b> · ⚠️ TP gagal "
-                             f"(code {_esc(prot.get('tp_code'))}) — guardian akan retry")
-            else:
-                lines.append("🛡️ <b>SL+TP terpasang &amp; TERVERIFIKASI</b> (conditional closePosition)")
+        if prot.get("ok"):
+            lines.append(f"🛡️ <b>SL/TP terpasang</b> (OCO · percobaan {prot.get('attempts')})")
         elif (prot.get("emergency_close") or {}).get("ok"):
-            lines.append(f"🚨 <b>SL gagal → posisi DITUTUP darurat</b> (reduce-only) · "
-                         f"Binance code {_esc(prot.get('code'))}: {_esc(prot.get('last_error'))}")
-        elif prot.get("last_error") or prot.get("code"):
-            lines.append(f"❌ <b>SL/TP GAGAL — CEK MANUAL</b> · Binance code {_esc(prot.get('code'))}: "
-                         f"{_esc(prot.get('last_error'))}")
+            lines.append("🚨 <b>SL/TP gagal → posisi DITUTUP darurat</b> (reduce-only)")
         elif e.get("warning"):
             lines.append(f"⚠️ <b>{_esc(e.get('warning'))}</b>")
         elif not prot:
             lines.append("ℹ️ SL/TP tidak dipasang (cek PLACE_SL_TP / stop &amp; target)")
 
     lines.append("")
-    lines.append(f"<i>Bukan nasihat finansial · Binance {_venue()}</i>")
+    lines.append("<i>Bukan nasihat finansial · Testnet</i>")
     return "\n".join(lines)
 
 
@@ -144,12 +123,12 @@ def format_notrade(decision, account):
     reasons = d.get("reasons", [])
     first = _esc(reasons[0]) if reasons else "-"
     waiting = _esc(d.get("flip_if") or d.get("abstain_reason") or "-")
-    joined = " ".join(reasons).lower()
-    icon = "🚫" if ("kill switch" in joined or "profit lock" in joined) else "⏸️"
-    conf = _num(d.get("confidence_pct"))
-    conf_txt = f" · conf {conf:.0f}%" if (conf is not None and conf > 0) else ""
+    icon = "🚫" if "kill switch" in " ".join(reasons).lower() else "⏸️"
+
+    # Full Modal & PnL block on every cycle (so the account is always visible),
+    # then a concise no-trade reason so it doesn't get verbose again.
     lines = [_header(account), "",
-             f"{icon} <b>NO-TRADE</b> · sinyal {_esc(d.get('signal'))}{conf_txt}",
+             f"{icon} <b>NO-TRADE</b> · sinyal {_esc(d.get('signal'))} · conf {d.get('confidence_pct')}%",
              f"• {first}"]
     if waiting and waiting != "-":
         lines.append(f"• Menunggu: {waiting}")
@@ -157,88 +136,43 @@ def format_notrade(decision, account):
 
 
 def format_guardian(actions, phase=""):
-    icon = {"PROTECTED": "✅", "PROTECTED_SYNTH": "🛰️", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓",
-            "NAKED_NO_ENTRY_PRICE": "⚠️", "CLOSED_BREACH": "⚡"}
-    head = "🛡️ <b>GUARDIAN</b>" + (f" <i>({_esc(phase)})</i>" if phase else "") + " — proteksi posisi:"
+    icon = {"PROTECTED": "✅", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓",
+            "NAKED_NO_ENTRY_PRICE": "⚠️"}
+    head = "🛡️ <b>GUARDIAN</b>" + (f" <i>({_esc(phase)})</i>" if phase else "") + " — posisi tanpa proteksi:"
     lines = [head]
     for g in actions:
         st = str(g.get("status", "?"))
-        extra = ""
-        if g.get("placed"):
-            extra += f" · pasang {_esc(g.get('placed'))}"
-        if g.get("last_error") or g.get("code"):
-            extra += f" · code {_esc(g.get('code'))}: {_esc(g.get('last_error'))}"
-        lines.append(f"{icon.get(st, '•')} {_esc(g.get('market'))}: {_esc(st)}{extra}")
+        lines.append(f"{icon.get(st, '•')} market {_esc(g.get('market'))}: {_esc(st)}")
     return "\n".join(lines)
 
 
 def format_online():
-    mode = "🧪 DRY-RUN" if CONFIG.dry_run else f"🔴 LIVE {_venue()}"
-    return (f"🤖 <b>Zupin Bot ONLINE</b> · {mode} · {CONFIG.symbol} · loop {CONFIG.loop_minutes} menit\n"
-            f"• Eksekusi: Binance {_venue()} · Data: Binance MAINNET (funding/OI/LS riil) + F&amp;G\n"
-            f"• Gerbang: conf ≥ {CONFIG.min_confidence:g}% · R:R ≥ {CONFIG.min_rr:g} · "
-            f"stop ≥ {CONFIG.min_stop_pct * 100:.2f}% · trend-only · min-notional aware\n"
-            f"• Kill switch: -{CONFIG.daily_loss_limit_pct * 100:g}%/hari → flatten + pause s.d. "
-            f"{(CONFIG.resume_hour + 7) % 24:02d}:00 WIB · Profit lock: +{CONFIG.daily_profit_target_pct * 100:g}%\n"
-            f"• Proteksi: mode <b>{CONFIG.protection_mode}</b>"
-            + (" (native→reduceOnly→sintetis)" if CONFIG.protection_mode == "auto" else ""))
+    mode = "🧪 DRY-RUN" if CONFIG.dry_run else "🔴 LIVE testnet"
+    return f"🤖 <b>Zupin Bot ONLINE</b> · {mode} · loop tiap {CONFIG.loop_minutes} menit"
 
 
-def format_position_guard(pos, account, protection=None, synth=None, mark=None):
-    lines = [_header(account), ""]
-    lines.append("⏸️ <b>Posisi masih terbuka — entry baru diblokir</b> (guard)")
-    lines.append(f"• Size: {_esc(pos.get('size'))} @ ${_f(pos.get('entry_price'))}")
-    if synth:
-        sl, tp = synth.get("sl"), synth.get("tp")
-        line = f"🛰️ <b>Proteksi SL/TP: MODE SINTETIS</b> — SL ${_f(sl)} · TP ${_f(tp)}"
-        if mark is not None:
-            line += f" · mark ${_f(mark)}"
-        lines.append(line)
-        lines.append("• ⚠️ TIDAK muncul di Open Orders exchange — ini NORMAL untuk mode sintetis "
-                     "(bot yang memantau &amp; menutup MARKET saat kena)")
-        lines.append("• Proteksi aktif hanya selama bot hidup")
-    elif protection == "native_full":
-        lines.append("🛡️ <b>SL+TP conditional AKTIF di exchange</b> (cek tab Open Orders)")
-    elif protection == "native_partial":
-        lines.append("⚠️ <b>Hanya sebagian proteksi native di exchange</b> — guardian melengkapi siklus ini")
-    else:
-        lines.append("❌ <b>Status proteksi BELUM terverifikasi</b> — cek log guardian / posisi mungkin telanjang")
-    lines.append("")
-    lines.append(f"<i>Bukan nasihat finansial · Binance {_venue()}</i>")
-    return "\n".join(lines)
+# ---- SLEEP MODE (posisi terbuka & terproteksi -> AI dijeda untuk hemat token) ----
+def format_sleep_enter(account, protected=True):
+    prot = "🛡️ SL/TP terverifikasi (OCO)" if protected else "⚠️ proteksi belum terverifikasi (guardian aktif)"
+    poll = CONFIG.sleep_poll_sec
+    return "\n".join([
+        _header(account), "",
+        "💤 <b>SLEEP MODE</b> — posisi aktif, AI dijeda (hemat token).",
+        f"• {prot}",
+        f"• Memantau posisi tiap {poll}s · guardian tiap {CONFIG.guardian_interval_sec // 60} menit.",
+        "• Bot akan bangun & cari sinyal lagi saat SL/TP tersentuh.",
+    ])
 
 
-def format_stale_cancel(n):
-    return (f"🧹 <b>Order lama disapu</b> · {n} order (limit basi / SL-TP yatim)\n"
-            "• Papan bersih sebelum siklus baru — tesis lama tidak dibawa")
+def format_sleep_pnl(account):
+    return "\n".join([
+        _header(account), "",
+        "💤 <b>Masih menunggu SL/TP…</b> — posisi belum tertutup.",
+    ])
 
 
-def format_kill_switch(account, res, resume_str):
-    ok_close = sum(1 for c in (res.get("closed") or []) if c.get("ok"))
-    flat = res.get("flat")
-    lines = [_header(account), "",
-             "🚨 <b>KILL SWITCH ACTIVATED</b>",
-             f"• Daily loss: {_sgn(account.get('daily_pnl_pct'))}% (limit: -{CONFIG.daily_loss_limit_pct * 100:.2f}%)",
-             f"• Semua order disapu: {'ya' if res.get('canceled') else 'gagal/cek'} · posisi ditutup: {ok_close}",
-             f"• Status flat: {'✅ ya' if flat else ('❓ belum terkonfirmasi' if flat is None else '❌ TIDAK — cek manual')}",
-             f"• Bot PAUSE sampai {resume_str}",
-             "", f"<i>Bukan nasihat finansial · Binance {_venue()}</i>"]
-    return "\n".join(lines)
-
-
-def format_sleep(resume_str, secs):
-    return f"💤 Bot tidur · lanjut {resume_str} (±{secs / 3600:.1f} jam)"
-
-
-def format_resume(account):
-    return "\n".join([_header(account), "",
-                      "✅ <b>Bot RESUMED</b> — baseline harian di-reset, kill switch terbuka"])
-
-
-def format_profit_lock(account):
-    lines = [_header(account), "",
-             "🎯 <b>TARGET HARIAN TERCAPAI — PROFIT LOCK</b>",
-             f"• Hari ini {_sgn(account.get('daily_pnl_pct'))}% ≥ target +{CONFIG.daily_profit_target_pct * 100:g}%",
-             "• Entry baru dikunci sampai besok · posisi berjalan tetap dikelola SL/TP + guardian",
-             "", f"<i>Bukan nasihat finansial · Binance {_venue()}</i>"]
-    return "\n".join(lines)
+def format_position_closed(account):
+    return "\n".join([
+        _header(account), "",
+        "✅ <b>Posisi tertutup</b> (SL/TP tersentuh) — bot kembali mencari sinyal.",
+    ])
