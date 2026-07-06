@@ -235,6 +235,27 @@ def format_resume(account):
                       "✅ <b>Bot RESUMED</b> — baseline harian di-reset, kill switch terbuka"])
 
 
+def format_daily_report(s, date_label):
+    head = f"📊 <b>Laporan Harian Zupin Bot</b> · {CONFIG.symbol} · Binance {_venue()}"
+    if not s.get("ok"):
+        if CONFIG.dry_run:
+            return f"{head}\n<i>{date_label}</i>\n\n🧪 DRY-RUN — tidak ada trade riil."
+        return f"{head}\n<i>{date_label}</i>\n\n⚠️ Gagal ambil histori: {_esc(s.get('error', '?'))}"
+    tr = s.get("trades", 0)
+    if tr == 0:
+        return f"{head}\n<i>Performa {date_label} (00:00–24:00 WIB)</i>\n\n• Tidak ada trade selesai kemarin."
+    return "\n".join([
+        head, f"<i>Performa {date_label} (00:00–24:00 WIB)</i>", "",
+        f"• Open/selesai: <b>{tr}</b> trade",
+        f"• Menang (TP/profit): <b>{s.get('wins', 0)}</b>  🟢",
+        f"• Kalah (SL/rugi): <b>{s.get('losses', 0)}</b>  🔴",
+        f"• Win rate: <b>{s.get('win_rate', 0):.0f}%</b>",
+        f"• PnL realized: {_dot(s.get('gross_pnl'))} ${_sgn(s.get('gross_pnl'))}",
+        f"• Fee: ${_sgn(s.get('commission'))} · Funding: ${_sgn(s.get('funding'))}",
+        f"• PnL net: {_dot(s.get('net_pnl'))} <b>${_sgn(s.get('net_pnl'))}</b>",
+    ])
+
+
 def format_profit_lock(account):
     lines = [_header(account), "",
              "🎯 <b>TARGET HARIAN TERCAPAI — PROFIT LOCK</b>",
