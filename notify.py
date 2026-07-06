@@ -1,56 +1,265 @@
-# ====== DeepSeek (AI) ======
-DEEPSEEK_API_KEY=
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-pro
-DEEPSEEK_THINKING=true
+"""Telegram notifications v4 (Binance). Emoji = sinyal STATUS, bukan dekorasi.
+Kejujuran tampilan: order gagal tidak boleh tampak sukses; limit resting BUKAN
+'terisi'; venue (TESTNET/MAINNET) selalu terlihat; conf hanya bila bermakna."""
+import httpx
+from config import CONFIG
 
-# ====== Binance USDT-M Futures ======
-# TESTNET (default) -- daftar & buat API key di https://testnet.binancefuture.com
-# MAINNET: ganti ke https://fapi.binance.com (JANGAN sebelum sampel testnet hijau)
-BINANCE_FUTURES_BASE=https://testnet.binancefuture.com
-BINANCE_DATA_BASE=https://fapi.binance.com
-BINANCE_API_KEY=
-BINANCE_API_SECRET=
-SYMBOL=BTCUSDT
-BINANCE_RECV_WINDOW=5000
-BINANCE_MIN_NOTIONAL=100
-TAKER_FEE_PCT=0.0005
-MAKER_FEE_PCT=0.0002
 
-# ====== Modal & proteksi ======
-INITIAL_CAPITAL=5000
-PLACE_SL_TP=true
-PROTECT_MAX_RETRIES=4
-PROTECT_RETRY_BACKOFF_SEC=3
-GUARDIAN_ENABLED=true
-GUARDIAN_STOP_PCT=0.01
-EMERGENCY_CLOSE_IF_UNPROTECTED=true
+def _venue():
+    return "MAINNET" if "fapi.binance.com" in CONFIG.binance_base else "TESTNET"
 
-# ====== Telegram ======
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
 
-# ====== Trading / engine ======
-INTERVAL=15m
-RISK_PCT=0.01
-MAX_LEVERAGE=10
-MIN_RR=2.0
-MIN_CONFIDENCE=65
-MIN_STOP_PCT=0.0035
-DAILY_LOSS_LIMIT_PCT=0.03
-DAILY_PROFIT_TARGET_PCT=0.10
-RESUME_HOUR=0
-BLOCK_IF_POSITION_OPEN=true
-CANCEL_STALE_ENTRIES=true
-LIMIT_FILL_WATCHER=true
-WATCH_POLL_SEC=20
-DRY_RUN=true
-LOOP_MINUTES=15
-NOTIFY_EVERY_CYCLE=true
-STATE_FILE=bot_state.json
+async def send(text, parse_mode="HTML"):
+    if not CONFIG.telegram_token or not CONFIG.telegram_chat_id:
+        print("[notify] telegram not configured; message:\n", text)
+        return
+    url = f"https://api.telegram.org/bot{CONFIG.telegram_token}/sendMessage"
+    payload = {"chat_id": CONFIG.telegram_chat_id, "text": text, "disable_web_page_preview": True}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    async with httpx.AsyncClient() as c:
+        try:
+            r = await c.post(url, json=payload, timeout=20)
+            if r.status_code != 200 and parse_mode:
+                payload.pop("parse_mode", None)
+                await c.post(url, json=payload, timeout=20)
+        except Exception as e:
+            print("[notify] send failed:", e)
 
-# ====== Laporan performa harian (Telegram) ======
-# Tiap DAILY_REPORT_HOUR_UTC kirim ringkasan trade KEMARIN: jumlah open, menang (TP),
-# kalah (SL), win rate, PnL. Sumber: histori income Binance (otoritatif, tahan restart).
-DAILY_REPORT_ENABLED=true
-DAILY_REPORT_HOUR_UTC=1   # 01:00 UTC = 08:00 WIB
+
+def _esc(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _f(x):
+    try:
+        return f"{float(x):,.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _sgn(x):
+    try:
+        return ("+" if float(x) >= 0 else "") + _f(x)
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _dot(x):
+    try:
+        return "🟢" if float(x) >= 0 else "🔴"
+    except (TypeError, ValueError):
+        return "⚪"
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _header(account):
+    a = account
+    return "\n".join([
+        f"🤖 <b>Zupin Bot</b> · {CONFIG.symbol} Perp · <b>Binance {_venue()}</b>",
+        "",
+        "💰 <b>Modal &amp; PnL</b>",
+        f"• Equity: <b>${_f(a.get('equity_usd'))}</b>  (awal ${_f(a.get('base_capital_usd'))})",
+        f"• Unrealized: {_dot(a.get('unrealized_pnl_usd'))} ${_sgn(a.get('unrealized_pnl_usd'))}",
+        f"• Hari ini: {_dot(a.get('realized_pnl_today_usd'))} ${_sgn(a.get('realized_pnl_today_usd'))} "
+        f"({_sgn(a.get('daily_pnl_pct'))}%)",
+    ])
+
+
+def format_trade(decision, account, exec_result):
+    d, e = decision, exec_result
+    dir_emoji = "📈" if d.get("signal") == "long" else "📉"
+
+    lines = [_header(account), ""]
+    lines.append(f"{dir_emoji} <b>ORDER {str(d.get('signal')).upper()}</b> · conf {d.get('confidence_pct')}%")
+    lines.append(f"• Regime: {_esc(d.get('regime'))}")
+    lines.append(f"• Entry: <b>${_f(d.get('entry'))}</b> ({_esc(d.get('entry_type'))})")
+    lines.append(f"• SL 🛑 ${_f(d.get('stop'))}")
+    tp = f"• TP 🎯 ${_f(d.get('tp1'))}"
+    if d.get("tp2"):
+        tp += f" → ${_f(d.get('tp2'))}"
+    lines.append(tp)
+    lines.append(f"• R:R ⚖️ {d.get('rr')} · risk 💵 ${_f(d.get('risk_usd'))} ({CONFIG.risk_pct * 100:g}%)")
+    lines.append(f"• Size 📦 ${_f(d.get('notional_usd'))} · {d.get('base_amount')} {CONFIG.symbol[:-4]}")
+    if d.get("fee_est_usd") is not None:
+        lines.append(f"• Fee est (worst) 🧾 ${_f(d.get('fee_est_usd'))}")
+    lines.append("")
+
+    if d.get("dry_run") or e.get("dry_run"):
+        lines.append("🧪 <b>DRY-RUN</b> — tidak ada order dikirim")
+    elif not e.get("ok"):
+        lines.append(f"❌ <b>Entry GAGAL</b>: {_esc(e.get('error', '?'))}")
+    else:
+        prot = e.get("protection") or {}
+        st = e.get("entry_status")
+        if st == "resting":
+            lines.append(f"⏳ <b>Limit dipasang — BELUM terisi</b> · order <code>{_esc(e.get('tx_hash'))}</code>")
+            lines.append("• Disapu otomatis siklus berikutnya jika tak tersentuh")
+        elif st == "partial":
+            lines.append(f"◔ <b>Limit terisi SEBAGIAN</b> · order <code>{_esc(e.get('tx_hash'))}</code>")
+        else:
+            lines.append(f"✅ <b>Entry terisi</b> · order <code>{_esc(e.get('tx_hash'))}</code>")
+        if prot.get("deferred"):
+            if prot.get("mode") == "watcher":
+                lines.append(f"🛡️ SL/TP menunggu fill — <b>watcher aktif</b> "
+                             f"(cek tiap {int(prot.get('poll_sec') or 5)} dtk)")
+            else:
+                lines.append("🛡️ SL/TP menunggu fill — guardian memproteksi di siklus berikutnya")
+        elif prot.get("closed"):
+            lines.append(f"⚡ <b>Posisi ditutup MARKET</b> — {_esc(prot.get('reason'))} "
+                         "(SL/TP sudah terpenuhi saat pemasangan)")
+        elif prot.get("mode") == "synthetic":
+            lines.append("🛡️ <b>Proteksi SL/TP: MODE SINTETIS</b> (dipantau bot, tutup MARKET saat harga kena)\n"
+                         "   ⚠️ hanya aktif selama bot hidup — bukan order tersimpan di exchange")
+        elif prot.get("ok"):
+            if prot.get("tp_verified") is False:
+                lines.append(f"🛡️ <b>SL terpasang &amp; TERVERIFIKASI</b> · ⚠️ TP gagal "
+                             f"(code {_esc(prot.get('tp_code'))}) — guardian akan retry")
+            else:
+                lines.append("🛡️ <b>SL+TP terpasang &amp; TERVERIFIKASI</b> (conditional closePosition)")
+        elif (prot.get("emergency_close") or {}).get("ok"):
+            lines.append(f"🚨 <b>SL gagal → posisi DITUTUP darurat</b> (reduce-only) · "
+                         f"Binance code {_esc(prot.get('code'))}: {_esc(prot.get('last_error'))}")
+        elif prot.get("last_error") or prot.get("code"):
+            lines.append(f"❌ <b>SL/TP GAGAL — CEK MANUAL</b> · Binance code {_esc(prot.get('code'))}: "
+                         f"{_esc(prot.get('last_error'))}")
+        elif e.get("warning"):
+            lines.append(f"⚠️ <b>{_esc(e.get('warning'))}</b>")
+        elif not prot:
+            lines.append("ℹ️ SL/TP tidak dipasang (cek PLACE_SL_TP / stop &amp; target)")
+
+    lines.append("")
+    lines.append(f"<i>Bukan nasihat finansial · Binance {_venue()}</i>")
+    return "\n".join(lines)
+
+
+def format_notrade(decision, account):
+    d = decision
+    reasons = d.get("reasons", [])
+    first = _esc(reasons[0]) if reasons else "-"
+    waiting = _esc(d.get("flip_if") or d.get("abstain_reason") or "-")
+    joined = " ".join(reasons).lower()
+    icon = "🚫" if ("kill switch" in joined or "profit lock" in joined) else "⏸️"
+    conf = _num(d.get("confidence_pct"))
+    conf_txt = f" · conf {conf:.0f}%" if (conf is not None and conf > 0) else ""
+    lines = [_header(account), "",
+             f"{icon} <b>NO-TRADE</b> · sinyal {_esc(d.get('signal'))}{conf_txt}",
+             f"• {first}"]
+    if waiting and waiting != "-":
+        lines.append(f"• Menunggu: {waiting}")
+    return "\n".join(lines)
+
+
+def format_guardian(actions, phase=""):
+    icon = {"PROTECTED": "✅", "PROTECTED_SYNTH": "🛰️", "STILL_NAKED": "⚠️", "UNVERIFIED": "❓",
+            "NAKED_NO_ENTRY_PRICE": "⚠️", "CLOSED_BREACH": "⚡"}
+    head = "🛡️ <b>GUARDIAN</b>" + (f" <i>({_esc(phase)})</i>" if phase else "") + " — proteksi posisi:"
+    lines = [head]
+    for g in actions:
+        st = str(g.get("status", "?"))
+        extra = ""
+        if g.get("placed"):
+            extra += f" · pasang {_esc(g.get('placed'))}"
+        if g.get("last_error") or g.get("code"):
+            extra += f" · code {_esc(g.get('code'))}: {_esc(g.get('last_error'))}"
+        lines.append(f"{icon.get(st, '•')} {_esc(g.get('market'))}: {_esc(st)}{extra}")
+    return "\n".join(lines)
+
+
+def format_online():
+    mode = "🧪 DRY-RUN" if CONFIG.dry_run else f"🔴 LIVE {_venue()}"
+    return (f"🤖 <b>Zupin Bot ONLINE</b> · {mode} · {CONFIG.symbol} · loop {CONFIG.loop_minutes} menit\n"
+            f"• Eksekusi: Binance {_venue()} · Data: Binance MAINNET (funding/OI/LS riil) + F&amp;G\n"
+            f"• Gerbang: conf ≥ {CONFIG.min_confidence:g}% · R:R ≥ {CONFIG.min_rr:g} · "
+            f"stop ≥ {CONFIG.min_stop_pct * 100:.2f}% · trend-only · min-notional aware\n"
+            f"• Kill switch: -{CONFIG.daily_loss_limit_pct * 100:g}%/hari → flatten + pause s.d. "
+            f"{(CONFIG.resume_hour + 7) % 24:02d}:00 WIB · Profit lock: +{CONFIG.daily_profit_target_pct * 100:g}%\n"
+            f"• Proteksi: mode <b>{CONFIG.protection_mode}</b>"
+            + (" (native→reduceOnly→sintetis)" if CONFIG.protection_mode == "auto" else ""))
+
+
+def format_position_guard(pos, account, protection=None, synth=None, mark=None):
+    lines = [_header(account), ""]
+    lines.append("⏸️ <b>Posisi masih terbuka — entry baru diblokir</b> (guard)")
+    lines.append(f"• Size: {_esc(pos.get('size'))} @ ${_f(pos.get('entry_price'))}")
+    if synth:
+        sl, tp = synth.get("sl"), synth.get("tp")
+        line = f"🛰️ <b>Proteksi SL/TP: MODE SINTETIS</b> — SL ${_f(sl)} · TP ${_f(tp)}"
+        if mark is not None:
+            line += f" · mark ${_f(mark)}"
+        lines.append(line)
+        lines.append("• ⚠️ TIDAK muncul di Open Orders exchange — ini NORMAL untuk mode sintetis "
+                     "(bot yang memantau &amp; menutup MARKET saat kena)")
+        lines.append("• Proteksi aktif hanya selama bot hidup")
+    elif protection == "native_full":
+        lines.append("🛡️ <b>SL+TP conditional AKTIF di exchange</b> (cek tab Open Orders)")
+    elif protection == "native_partial":
+        lines.append("⚠️ <b>Hanya sebagian proteksi native di exchange</b> — guardian melengkapi siklus ini")
+    else:
+        lines.append("❌ <b>Status proteksi BELUM terverifikasi</b> — cek log guardian / posisi mungkin telanjang")
+    lines.append("")
+    lines.append(f"<i>Bukan nasihat finansial · Binance {_venue()}</i>")
+    return "\n".join(lines)
+
+
+def format_stale_cancel(n):
+    return (f"🧹 <b>Order lama disapu</b> · {n} order (limit basi / SL-TP yatim)\n"
+            "• Papan bersih sebelum siklus baru — tesis lama tidak dibawa")
+
+
+def format_kill_switch(account, res, resume_str):
+    ok_close = sum(1 for c in (res.get("closed") or []) if c.get("ok"))
+    flat = res.get("flat")
+    lines = [_header(account), "",
+             "🚨 <b>KILL SWITCH ACTIVATED</b>",
+             f"• Daily loss: {_sgn(account.get('daily_pnl_pct'))}% (limit: -{CONFIG.daily_loss_limit_pct * 100:.2f}%)",
+             f"• Semua order disapu: {'ya' if res.get('canceled') else 'gagal/cek'} · posisi ditutup: {ok_close}",
+             f"• Status flat: {'✅ ya' if flat else ('❓ belum terkonfirmasi' if flat is None else '❌ TIDAK — cek manual')}",
+             f"• Bot PAUSE sampai {resume_str}",
+             "", f"<i>Bukan nasihat finansial · Binance {_venue()}</i>"]
+    return "\n".join(lines)
+
+
+def format_sleep(resume_str, secs):
+    return f"💤 Bot tidur · lanjut {resume_str} (±{secs / 3600:.1f} jam)"
+
+
+def format_resume(account):
+    return "\n".join([_header(account), "",
+                      "✅ <b>Bot RESUMED</b> — baseline harian di-reset, kill switch terbuka"])
+
+
+def format_daily_report(s, date_label):
+    head = f"📊 <b>Laporan Harian Zupin Bot</b> · {CONFIG.symbol} · Binance {_venue()}"
+    if not s.get("ok"):
+        if CONFIG.dry_run:
+            return f"{head}\n<i>{date_label}</i>\n\n🧪 DRY-RUN — tidak ada trade riil."
+        return f"{head}\n<i>{date_label}</i>\n\n⚠️ Gagal ambil histori: {_esc(s.get('error', '?'))}"
+    tr = s.get("trades", 0)
+    if tr == 0:
+        return f"{head}\n<i>Performa {date_label} (00:00–24:00 WIB)</i>\n\n• Tidak ada trade selesai kemarin."
+    return "\n".join([
+        head, f"<i>Performa {date_label} (00:00–24:00 WIB)</i>", "",
+        f"• Open/selesai: <b>{tr}</b> trade",
+        f"• Menang (TP/profit): <b>{s.get('wins', 0)}</b>  🟢",
+        f"• Kalah (SL/rugi): <b>{s.get('losses', 0)}</b>  🔴",
+        f"• Win rate: <b>{s.get('win_rate', 0):.0f}%</b>",
+        f"• PnL realized: {_dot(s.get('gross_pnl'))} ${_sgn(s.get('gross_pnl'))}",
+        f"• Fee: ${_sgn(s.get('commission'))} · Funding: ${_sgn(s.get('funding'))}",
+        f"• PnL net: {_dot(s.get('net_pnl'))} <b>${_sgn(s.get('net_pnl'))}</b>",
+    ])
+
+
+def format_profit_lock(account):
+    lines = [_header(account), "",
+             "🎯 <b>TARGET HARIAN TERCAPAI — PROFIT LOCK</b>",
+             f"• Hari ini {_sgn(account.get('daily_pnl_pct'))}% ≥ target +{CONFIG.daily_profit_target_pct * 100:g}%",
+             "• Entry baru dikunci sampai besok · posisi berjalan tetap dikelola SL/TP + guardian",
+             "", f"<i>Bukan nasihat finansial · Binance {_venue()}</i>"]
+    return "\n".join(lines)
