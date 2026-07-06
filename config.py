@@ -86,6 +86,9 @@ class Config:
     loop_minutes: int = _i("LOOP_MINUTES", "15")
     notify_every_cycle: bool = _b("NOTIFY_EVERY_CYCLE", "true")
     state_file: str = os.getenv("STATE_FILE", "bot_state.json")
+    # --- Laporan performa harian (Telegram) ---
+    daily_report_enabled: bool = _b("DAILY_REPORT_ENABLED", "true")
+    daily_report_hour_utc: int = _i("DAILY_REPORT_HOUR_UTC", "1")   # 01:00 UTC = 08:00 WIB
 
 
 CONFIG = Config()
