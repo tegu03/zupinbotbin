@@ -626,6 +626,46 @@ class Exchange:
             out["flat"] = self.open_position(fresh) is None
         return out
 
+    # ---- LAPORAN: ringkasan trade dari histori income Binance (otoritatif) ----
+    async def income_summary(self, start_ms, end_ms):
+        """Ringkas performa trade dalam jendela [start_ms, end_ms] dari /fapi/v1/income.
+        Sumber otoritatif (tahan restart bot; tak perlu logging sendiri).
+        1 trade = kumpulan baris REALIZED_PNL yang berdekatan (<120 dtk) -- partial-fill
+        tidak dihitung dobel. Menang = PnL trade > 0 (TP/profit); kalah = < 0 (SL)."""
+        out = {"trades": 0, "wins": 0, "losses": 0, "gross_pnl": 0.0,
+               "commission": 0.0, "funding": 0.0, "net_pnl": 0.0, "win_rate": 0.0, "ok": False}
+        if not CONFIG.binance_api_key or CONFIG.dry_run:
+            return out
+        try:
+            rows = await self.c.sget("/fapi/v1/income", symbol=CONFIG.symbol,
+                                     startTime=int(start_ms), endTime=int(end_ms), limit=1000)
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+            return out
+        rows = rows or []
+        out["commission"] = round(sum(float(r.get("income") or 0) for r in rows
+                                      if str(r.get("incomeType")) == "COMMISSION"), 4)
+        out["funding"] = round(sum(float(r.get("income") or 0) for r in rows
+                                   if str(r.get("incomeType")) == "FUNDING_FEE"), 4)
+        realized = sorted([r for r in rows if str(r.get("incomeType")) == "REALIZED_PNL"],
+                          key=lambda x: int(x.get("time") or 0))
+        trades, last_t = [], None
+        for r in realized:
+            t = int(r.get("time") or 0)
+            v = float(r.get("income") or 0)
+            if not trades or (last_t is not None and t - last_t > 120000):
+                trades.append(0.0)
+            trades[-1] += v
+            last_t = t
+        out["trades"] = len(trades)
+        out["wins"] = sum(1 for p in trades if p > 0)
+        out["losses"] = sum(1 for p in trades if p < 0)
+        out["gross_pnl"] = round(sum(trades), 4)
+        out["net_pnl"] = round(out["gross_pnl"] + out["commission"] + out["funding"], 4)
+        out["win_rate"] = round(out["wins"] / out["trades"] * 100, 1) if out["trades"] else 0.0
+        out["ok"] = True
+        return out
+
     # ---- FILL WATCHER: proteksi diikat ke saat fill untuk limit resting ----
     def start_fill_watcher(self, decision, order_id):
         if self._watch_task and not self._watch_task.done():
