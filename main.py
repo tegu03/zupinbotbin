@@ -25,7 +25,7 @@ from risk import evaluate
 from exchange import Exchange, kill_latched, latch_kill, profit_latched, latch_profit
 from notify import (send, format_trade, format_notrade, format_guardian, format_online,
                     format_position_guard, format_stale_cancel, format_kill_switch,
-                    format_sleep, format_resume, format_profit_lock)
+                    format_sleep, format_resume, format_profit_lock, format_daily_report)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("pte-bot")
@@ -43,6 +43,44 @@ def _resume_str():
     h_utc = CONFIG.resume_hour % 24
     h_wib = (h_utc + 7) % 24
     return f"{h_wib:02d}:00 WIB ({h_utc:02d}:00 UTC)"
+
+
+def _seconds_until_utc_hour(hour):
+    now = int(time.time())
+    tm = time.gmtime(now)
+    today = calendar.timegm((tm.tm_year, tm.tm_mon, tm.tm_mday, hour % 24, 0, 0))
+    target = today if now < today else today + 86400
+    return max(30, target - now)
+
+
+def _yesterday_wib_window():
+    """(start_ms, end_ms, label) untuk 00:00–24:00 WIB KEMARIN, dalam epoch UTC ms."""
+    now = time.time()
+    wib_day_start = (int(now + 7 * 3600) // 86400) * 86400   # 00:00 WIB hari ini (epoch WIB)
+    end = wib_day_start - 7 * 3600                            # -> epoch UTC untuk 00:00 WIB hari ini
+    start = end - 86400                                       # 00:00 WIB kemarin
+    label = time.strftime("%Y-%m-%d", time.gmtime(int(start) + 7 * 3600))
+    return int(start * 1000), int(end * 1000), label
+
+
+async def daily_report_loop(ex: Exchange):
+    """Tiap DAILY_REPORT_HOUR_UTC (default 01:00 UTC = 08:00 WIB): kirim ringkasan
+    performa trade KEMARIN (jumlah open, menang/TP, kalah/SL, win rate) ke Telegram.
+    Task terpisah -> tetap jalan walau main loop sedang tidur (kill switch dll)."""
+    if not CONFIG.daily_report_enabled:
+        return
+    while True:
+        await asyncio.sleep(_seconds_until_utc_hour(CONFIG.daily_report_hour_utc))
+        try:
+            start_ms, end_ms, label = _yesterday_wib_window()
+            summary = await ex.income_summary(start_ms, end_ms)
+            await send(format_daily_report(summary, label))
+            log.info("daily report sent (%s): %s", label, summary)
+        except Exception as e:
+            log.warning("daily report error: %s", e)
+            with contextlib.suppress(Exception):
+                await send(f"⚠️ Laporan harian gagal: {type(e).__name__}: {e}")
+        await asyncio.sleep(90)  # lewati menit pemicu supaya tidak dobel-kirim
 
 
 async def kill_flow(ex: Exchange, account):
@@ -167,6 +205,7 @@ async def main():
     log.info("BOT START | dry_run=%s | venue=%s | model=%s | loop=%dmin",
              CONFIG.dry_run, CONFIG.binance_base, CONFIG.model, CONFIG.loop_minutes)
     await send(format_online())
+    report_task = asyncio.create_task(daily_report_loop(ex))
     if not CONFIG.dry_run and kill_latched():
         secs = _seconds_until_resume()
         await send(f"⛔ Kill switch masih terkunci — bot tidur sampai {_resume_str()}.")
@@ -181,6 +220,7 @@ async def main():
                     await send(f"Zupin Bot ERROR: {type(e).__name__}: {e}")
             await asyncio.sleep(CONFIG.loop_minutes * 60)
     finally:
+        report_task.cancel()
         await ex.close()
 
 
